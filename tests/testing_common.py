@@ -16,6 +16,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import tempfile
 from collections import OrderedDict
 from dataclasses import replace
@@ -25,11 +26,13 @@ import torch
 import yaml
 from diffusers import StableDiffusionPipeline
 from packaging import version
+from safetensors.torch import save_file
 
 from peft import (
     AdaLoraConfig,
     BOFTConfig,
     FourierFTConfig,
+    HRAConfig,
     IA3Config,
     LNTuningConfig,
     LoHaConfig,
@@ -41,6 +44,7 @@ from peft import (
     PromptEncoderConfig,
     PromptLearningConfig,
     PromptTuningConfig,
+    VBLoRAConfig,
     VeraConfig,
     get_peft_model,
     get_peft_model_state_dict,
@@ -102,6 +106,12 @@ CONFIG_TESTING_KWARGS = (
         "n_frequency": 10,
         "target_modules": None,
     },
+    # HRA
+    {
+        "target_modules": None,
+    },
+    # VBLoRA
+    {"target_modules": None, "vblora_dropout": 0.05, "vector_length": 1, "num_vectors": 2},
 )
 
 CLASSES_MAPPING = {
@@ -112,8 +122,10 @@ CLASSES_MAPPING = {
     "prompt_tuning": (PromptTuningConfig, CONFIG_TESTING_KWARGS[4]),
     "adalora": (AdaLoraConfig, CONFIG_TESTING_KWARGS[5]),
     "boft": (BOFTConfig, CONFIG_TESTING_KWARGS[6]),
-    "vera": (VeraConfig, CONFIG_TESTING_KWARGS[6]),
+    "vera": (VeraConfig, CONFIG_TESTING_KWARGS[7]),
     "fourierft": (FourierFTConfig, CONFIG_TESTING_KWARGS[8]),
+    "hra": (HRAConfig, CONFIG_TESTING_KWARGS[9]),
+    "vblora": (VBLoRAConfig, CONFIG_TESTING_KWARGS[10]),
 }
 
 
@@ -465,7 +477,7 @@ class PeftCommonTester:
             assert model_from_pretrained.peft_config["default"] is config
 
     def _test_merge_layers_fp16(self, model_id, config_cls, config_kwargs):
-        if config_cls not in (LoraConfig, IA3Config, AdaLoraConfig, LoHaConfig, LoKrConfig):
+        if config_cls not in (LoraConfig, IA3Config, AdaLoraConfig, LoHaConfig, LoKrConfig, VBLoRAConfig):
             # Merge layers only supported for LoRA and IA³
             return pytest.skip(f"Test not applicable for {config_cls}")
 
@@ -615,9 +627,17 @@ class PeftCommonTester:
         # test that the logits are identical after a save-load-roundtrip
         if hasattr(model, "save_pretrained"):
             # model is a transformers model
-            with tempfile.TemporaryDirectory() as tmp_dirname:
+            tmp_dirname = tempfile.mkdtemp()
+            # note: not using the context manager here because it fails on Windows CI for some reason
+            try:
                 model.save_pretrained(tmp_dirname)
                 model_from_pretrained = self.transformers_class.from_pretrained(tmp_dirname).to(self.torch_device)
+            finally:
+                try:
+                    shutil.rmtree(tmp_dirname)
+                except PermissionError:
+                    # windows error
+                    pass
         else:
             # model is not a transformers model
             model_from_pretrained = pickle.loads(pickle.dumps(model))
@@ -626,7 +646,15 @@ class PeftCommonTester:
         assert torch.allclose(logits_merged, logits_merged_from_pretrained, atol=atol, rtol=rtol)
 
     def _test_merge_layers_multi(self, model_id, config_cls, config_kwargs):
-        supported_peft_types = [PeftType.LORA, PeftType.LOHA, PeftType.LOKR, PeftType.IA3, PeftType.OFT, PeftType.BOFT]
+        supported_peft_types = [
+            PeftType.LORA,
+            PeftType.LOHA,
+            PeftType.LOKR,
+            PeftType.IA3,
+            PeftType.OFT,
+            PeftType.BOFT,
+            PeftType.HRA,
+        ]
 
         if ("gpt2" in model_id.lower()) and (config_cls == IA3Config):
             self.skipTest("Merging GPT2 adapters not supported for IA³ (yet)")
@@ -739,6 +767,14 @@ class PeftCommonTester:
             atol, rtol = 1e-3, 1e-3  # MLU
         # check that the logits are the same after unloading
         assert torch.allclose(logits_peft, logits_unloaded, atol=atol, rtol=rtol)
+
+        # Ensure that serializing with safetensors works, there was an error when weights were not contiguous
+        with tempfile.TemporaryDirectory() as tmp_dirname:
+            # serializing with torch.save works
+            torch.save(model_unloaded.state_dict(), os.path.join(tmp_dirname, "model.bin"))
+
+            # serializing with safetensors works
+            save_file(model_unloaded.state_dict(), os.path.join(tmp_dirname, "model.safetensors"))
 
     def _test_mixed_adapter_batches(self, model_id, config_cls, config_kwargs):
         # Test for mixing different adapters in a single batch by passing the adapter_names argument
@@ -1026,7 +1062,7 @@ class PeftCommonTester:
                 assert param.grad is None
 
     def _test_peft_model_device_map(self, model_id, config_cls, config_kwargs):
-        if config_cls not in (LoraConfig,):
+        if config_cls not in (LoraConfig, VBLoRAConfig):
             return pytest.skip(f"Test not applicable for {config_cls}")
 
         config = config_cls(
@@ -1080,6 +1116,8 @@ class PeftCommonTester:
             PeftType.BOFT,
             PeftType.VERA,
             PeftType.FOURIERFT,
+            PeftType.HRA,
+            PeftType.VBLORA,
         ]
         # IA3 does not support deleting adapters yet, but it just needs to be added
         # AdaLora does not support multiple adapters
@@ -1126,6 +1164,8 @@ class PeftCommonTester:
             PeftType.OFT,
             PeftType.BOFT,
             PeftType.FOURIERFT,
+            PeftType.HRA,
+            PeftType.VBLORA,
         ]
         # IA3 does not support deleting adapters yet, but it just needs to be added
         # AdaLora does not support multiple adapters
@@ -1171,7 +1211,7 @@ class PeftCommonTester:
         model = get_peft_model(model, config)
         model = model.to(self.torch_device)
 
-        if config.peft_type not in ("LORA", "ADALORA", "IA3", "BOFT", "VERA", "FOURIERFT"):
+        if config.peft_type not in ("LORA", "ADALORA", "IA3", "BOFT", "VERA", "FOURIERFT", "HRA", "VBLORA"):
             with pytest.raises(AttributeError):
                 model = model.unload()
         else:
@@ -1403,6 +1443,9 @@ class PeftCommonTester:
         if issubclass(config_cls, AdaLoraConfig):
             # AdaLora does not support adding more than 1 adapter
             return pytest.skip(f"Test not applicable for {config_cls}")
+        if model_id.endswith("qwen2"):
+            # Qwen2 fails with weighted adapter combinations using SVD
+            return pytest.skip(f"Test does not work with model {model_id}")
 
         adapter_list = ["adapter1", "adapter_2", "adapter_3"]
         weight_list = [0.5, 1.5, 1.5]

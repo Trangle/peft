@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.11.2.dev0"
+__version__ = "0.12.1.dev0"
 
 from .auto import (
     AutoPeftModel,
@@ -80,12 +80,17 @@ from .tuners import (
     PolyModel,
     LNTuningConfig,
     LNTuningModel,
+    VBLoRAConfig,
+    VBLoRAModel,
     VeraConfig,
     VeraModel,
     FourierFTConfig,
     FourierFTModel,
     XLoraConfig,
     XLoraModel,
+    HRAConfig,
+    HRAModel,
+    VBLoRAConfig,
 )
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
