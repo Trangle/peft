@@ -30,12 +30,14 @@ from transformers import (
     AutoModelForSequenceClassification,
     BitsAndBytesConfig,
 )
+from transformers.pytorch_utils import Conv1D
 
 from peft import (
     AdaptionPromptConfig,
     IA3Config,
     LoHaConfig,
     LoraConfig,
+    PeftModel,
     PromptTuningConfig,
     VeraConfig,
     get_layer_status,
@@ -56,7 +58,7 @@ from peft.tuners.tuners_utils import (
 from peft.utils import INCLUDE_LINEAR_LAYERS_SHORTHAND, ModulesToSaveWrapper, infer_device
 from peft.utils.constants import DUMMY_MODEL_CONFIG, MIN_TARGET_MODULES_FOR_OPTIMIZATION
 
-from .testing_utils import require_bitsandbytes, require_non_cpu, require_torch_gpu
+from .testing_utils import require_bitsandbytes, require_non_cpu
 
 
 # Implements tests for regex matching logic common for all BaseTuner subclasses, and
@@ -92,9 +94,6 @@ REGEX_TEST_CASES = [
     ("foo.bar.1.baz", ["baz"], [0, 1, 2], ["bar"], True),
     ("foo.bar.1.baz", ["baz", "spam"], [1], ["bar"], True),
     ("foo.bar.1.baz", ["baz", "spam"], [0, 1, 2], ["bar"], True),
-    # empty layers_to_transform
-    ("foo.bar.7.baz", ["baz"], [], ["bar"], True),
-    ("foo.bar.7.baz", ["baz"], None, ["bar"], True),
     # empty layers_pattern
     ("foo.whatever.1.baz", ["baz"], [1], [], True),
     ("foo.whatever.1.baz", ["baz"], [0], [], False),
@@ -273,7 +272,7 @@ class PeftCustomKwargsTester(unittest.TestCase):
         )
 
     @parameterized.expand(BNB_TEST_CASES)
-    @require_torch_gpu
+    @require_non_cpu
     @require_bitsandbytes
     def test_maybe_include_all_linear_layers_lora_bnb(
         self, model_id, model_type, initial_target_modules, expected_target_modules, quantization
@@ -333,14 +332,15 @@ class PeftCustomKwargsTester(unittest.TestCase):
             assert new_config.target_modules == expected_target_modules
 
     def test_maybe_include_all_linear_layers_diffusion(self):
-        model_id = "hf-internal-testing/tiny-stable-diffusion-torch"
+        model_id = "hf-internal-testing/tiny-sd-pipe"
         model = StableDiffusionPipeline.from_pretrained(model_id)
         config = LoraConfig(base_model_name_or_path=model_id, target_modules="all-linear")
-        with pytest.raises(
-            ValueError,
-            match="Only instances of PreTrainedModel support `target_modules='all-linear'`",
-        ):
-            model.unet = get_peft_model(model.unet, config)
+
+        # all linear layers should be converted
+        num_linear = sum(isinstance(module, (nn.Linear, Conv1D)) for module in model.unet.modules())
+        model.unet = get_peft_model(model.unet, config)
+        num_lora = sum(isinstance(module, LoraLayer) for module in model.unet.modules())
+        assert num_lora == num_linear
 
     def test_maybe_include_all_linear_does_not_target_classifier_head(self):
         # See issue 2027
@@ -351,6 +351,8 @@ class PeftCustomKwargsTester(unittest.TestCase):
         # sanity check
         assert isinstance(model.score, nn.Linear)
 
+        num_linear = sum(isinstance(module, (nn.Linear, Conv1D)) for module in model.modules())
+
         config = LoraConfig(task_type="SEQ_CLS", target_modules="all-linear")
         model = get_peft_model(model, config)
         assert isinstance(model.base_model.score, ModulesToSaveWrapper)
@@ -358,6 +360,64 @@ class PeftCustomKwargsTester(unittest.TestCase):
         # the bug was that these were lora.Linear instances
         assert isinstance(model.base_model.score.original_module, nn.Linear)
         assert isinstance(model.base_model.score.modules_to_save["default"], nn.Linear)
+
+        # ensure that all but one linear layer was targeted by LoRA
+        num_lora = sum(isinstance(module, LoraLayer) for module in model.modules())
+        assert num_lora == num_linear - 1
+
+    @parameterized.expand(MAYBE_INCLUDE_ALL_LINEAR_LAYERS_TEST_CASES)
+    def test_all_linear_nested_targets_correct_layers(
+        self, model_id, model_type, initial_target_modules, expected_target_modules
+    ):
+        # See 2390
+        # Ensure that if adapter layers are already applied, we don't get nested adapter layers (e.g. LoRA targeting the
+        # lora_A, lora_B layers)
+        model = self.transformers_class_map[model_type].from_pretrained(model_id)
+        config_cls = LoraConfig
+        self._check_match_with_expected_target_modules(
+            model_id, model, config_cls, initial_target_modules, expected_target_modules
+        )
+        # re-use the same model, i.e. the adapter is already applied
+        self._check_match_with_expected_target_modules(
+            model_id, model, config_cls, initial_target_modules, expected_target_modules
+        )
+
+    def test_add_second_adapter_with_all_linear_works(self):
+        # See 2390 Similar test to test_all_linear_nested_targets_correct_layers above, but using add_adapter instead of
+        # calling get_peft_model in an already adapted model
+        model_id = "HuggingFaceH4/tiny-random-LlamaForCausalLM"
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+
+        # important: don't reuse the first config, since config.target_modules will be overwritten, which would make the
+        # test pass trivially.
+        config0 = LoraConfig(target_modules=INCLUDE_LINEAR_LAYERS_SHORTHAND)
+        config1 = LoraConfig(target_modules=INCLUDE_LINEAR_LAYERS_SHORTHAND)
+
+        model = get_peft_model(model, config0)
+        model.add_adapter(adapter_name="other", peft_config=config1)
+
+        # both configs should result in the same target modules being chosen (remember that config.target_modules will
+        # be replaced by the actual set of target_modules)
+        assert config0.target_modules == config1.target_modules
+
+        for layer in model.base_model.model.model.layers:
+            projs = (
+                layer.self_attn.q_proj,
+                layer.self_attn.v_proj,
+                layer.self_attn.k_proj,
+                layer.mlp.gate_proj,
+                layer.mlp.up_proj,
+                layer.mlp.down_proj,
+            )
+            for proj in projs:
+                # the targted layer itself, which in the base model was the nn.Linear layer, is now a LoraLayer
+                assert isinstance(proj, LoraLayer)
+                # all children of that layer are still normal nn.Linear layers
+                assert isinstance(proj.base_layer, nn.Linear)
+                assert isinstance(proj.lora_A["default"], nn.Linear)
+                assert isinstance(proj.lora_B["default"], nn.Linear)
+                assert isinstance(proj.lora_A["other"], nn.Linear)
+                assert isinstance(proj.lora_B["other"], nn.Linear)
 
 
 class MLP(nn.Module):
@@ -412,6 +472,79 @@ class TestTargetedModuleNames(unittest.TestCase):
         model = get_peft_model(model, config)
         expected = [
             f"transformer.h.{i}.self_attention.query_key_value" for i in range(len(model.base_model.transformer.h))
+        ]
+        assert model.targeted_module_names == expected
+
+
+class TestExcludedModuleNames(unittest.TestCase):
+    """Check that the attribute exclude_module is correctly set.
+
+    This checks LoRA and IA³, but this should be sufficient, testing all other tuners is not necessary.
+    """
+
+    def test_two_excluded_module_regex(self):
+        model = MLP()
+        model = get_peft_model(model, LoraConfig(target_modules=("lin.*"), exclude_modules="lin0"))
+        assert model.targeted_module_names == ["lin1"]
+
+    def test_two_excluded_module_list(self):
+        model = MLP()
+        model = get_peft_model(model, LoraConfig(target_modules=["lin0", "lin1"], exclude_modules="lin0"))
+        assert model.targeted_module_names == ["lin1"]
+
+    def test_multiple_excluded_modules_list(self):
+        model = MLP()
+        model = get_peft_model(model, LoraConfig(target_modules=["lin0", "lin1"], exclude_modules=["lin0"]))
+        assert model.targeted_module_names == ["lin1"]
+
+    def test_ia3_two_excluded_module_regex(self):
+        model = MLP()
+        model = get_peft_model(
+            model, IA3Config(target_modules=".*lin.*", feedforward_modules=".*lin.*", exclude_modules="lin0")
+        )
+        assert model.targeted_module_names == ["lin1"]
+
+    def test_ia3_multiple_excluded_modules_list(self):
+        model = MLP()
+        model = get_peft_model(
+            model, IA3Config(target_modules=["lin0", "lin1"], feedforward_modules=".*lin.*", exclude_modules=["lin1"])
+        )
+        assert model.targeted_module_names == ["lin0"]
+
+    def test_all_modules_excluded(self):
+        model = MLP()
+        with pytest.raises(ValueError, match="All modules were excluded"):
+            get_peft_model(
+                model,
+                LoraConfig(
+                    target_modules=["lin0", "lin1", "relu", "drop", "sm"],
+                    exclude_modules=["lin0", "lin1", "relu", "drop", "sm"],
+                ),
+            )
+
+    def test_no_modules_matched(self):
+        model = MLP()
+        with pytest.raises(ValueError, match="Target modules .* not found in the base model"):
+            get_peft_model(model, LoraConfig(target_modules=["non_existent_module"]))
+
+    def test_some_modules_excluded_some_unmatched(self):
+        model = MLP()
+        with pytest.raises(ValueError, match="No modules were targeted for adaptation"):
+            get_peft_model(model, LoraConfig(target_modules=["lin0", "non_existent_module"], exclude_modules=["lin0"]))
+
+    def test_exclude_modules_not_used(self):
+        model = MLP()
+        with pytest.warns(UserWarning, match="You have passed exclude_modules=.* but no modules were excluded"):
+            get_peft_model(model, LoraConfig(target_modules=["lin1"], exclude_modules=["non_existent_module"]))
+
+    def test_realistic_example(self):
+        model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-BloomForCausalLM")
+        config = LoraConfig(task_type="CAUSAL_LM", exclude_modules="transformer.h.2.self_attention.query_key_value")
+        model = get_peft_model(model, config)
+        expected = [
+            f"transformer.h.{i}.self_attention.query_key_value"
+            for i in range(len(model.base_model.transformer.h))
+            if i != 2
         ]
         assert model.targeted_module_names == expected
 
@@ -1246,7 +1379,7 @@ class TestFindMinimalTargetModules:
             find_minimal_target_modules(target_modules, other_module_names)
 
     def test_get_peft_model_applies_find_target_modules(self):
-        # Check that when calling get_peft_model, the target_module optimization is indeed applied if the lenght of
+        # Check that when calling get_peft_model, the target_module optimization is indeed applied if the length of
         # target_modules is big enough. The resulting model itself should be unaffected.
         torch.manual_seed(0)
         model_id = "facebook/opt-125m"  # must be big enough for optimization to trigger
@@ -1282,3 +1415,461 @@ class TestFindMinimalTargetModules:
         # check that the resulting model is still the same
         model_check_after = sum(p.sum() for p in model.parameters())
         assert model_check_sum_before == model_check_after
+
+    def test_suffix_is_substring_of_other_suffix(self):
+        # This test is based on a real world bug found in diffusers. The issue was that we needed the suffix
+        # 'time_emb_proj' in the minimal target modules. However, if there already was the suffix 'proj' in the
+        # required_suffixes, 'time_emb_proj' would not be added because the test was `endswith(suffix)` and
+        # 'time_emb_proj' ends with 'proj'. The correct logic is to test if `endswith("." + suffix")`. The module names
+        # chosen here are only a subset of the hundreds of actual module names but this subset is sufficient to
+        # replicate the bug.
+        target_modules = [
+            "down_blocks.1.attentions.0.transformer_blocks.0.ff.net.0.proj",
+            "mid_block.attentions.0.transformer_blocks.0.ff.net.0.proj",
+            "up_blocks.0.attentions.0.transformer_blocks.0.ff.net.0.proj",
+            "mid_block.attentions.0.proj_out",
+            "up_blocks.0.attentions.0.proj_out",
+            "down_blocks.1.attentions.0.proj_out",
+            "up_blocks.0.resnets.0.time_emb_proj",
+            "down_blocks.0.resnets.0.time_emb_proj",
+            "mid_block.resnets.0.time_emb_proj",
+        ]
+        other_module_names = [
+            "conv_in",
+            "time_proj",
+            "time_embedding",
+            "time_embedding.linear_1",
+            "add_time_proj",
+            "add_embedding",
+            "add_embedding.linear_1",
+            "add_embedding.linear_2",
+            "down_blocks",
+            "down_blocks.0",
+            "down_blocks.0.resnets",
+            "down_blocks.0.resnets.0",
+            "up_blocks",
+            "up_blocks.0",
+            "up_blocks.0.attentions",
+            "up_blocks.0.attentions.0",
+            "up_blocks.0.attentions.0.norm",
+            "up_blocks.0.attentions.0.transformer_blocks",
+            "up_blocks.0.attentions.0.transformer_blocks.0",
+            "up_blocks.0.attentions.0.transformer_blocks.0.norm1",
+            "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
+        ]
+        expected = {"time_emb_proj", "proj", "proj_out"}
+        result = find_minimal_target_modules(target_modules, other_module_names)
+        assert result == expected
+
+    def test_get_peft_modules_module_name_is_suffix_of_another_module(self):
+        # Solves the following bug:
+        # https://github.com/huggingface/diffusers/pull/9622#issuecomment-2404789721
+
+        # The cause for the bug is as follows: When we have, say, a module called "bar.0.query" that we want to target
+        # and another module called "foo_bar.0.query" that we don't want to target, there was potential for an error.
+        # This is not caused by _find_minimal_target_modules directly, but rather the bug was inside of
+        # BaseTuner.inject_adapter and how the names_no_target were chosen. Those used to be chosen based on suffix. In
+        # our example, however, "bar.0.query" is a suffix of "foo_bar.0.query", therefore "foo_bar.0.query" was *not*
+        # added to names_no_target when it should have. As a consequence, during the optimization, it looks like "query"
+        # is safe to use as target_modules because we don't see that it wrongly matches "foo_bar.0.query".
+
+        # ensure that we have sufficiently many modules to trigger the optimization
+        n_layers = MIN_TARGET_MODULES_FOR_OPTIMIZATION + 1
+
+        class InnerModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.query = nn.Linear(10, 10)
+
+        class OuterModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # note that "transformer_blocks" is a suffix of "single_transformer_blocks"
+                self.transformer_blocks = nn.ModuleList([InnerModule() for _ in range(n_layers)])
+                self.single_transformer_blocks = nn.ModuleList([InnerModule() for _ in range(n_layers)])
+
+        # we want to match all "transformer_blocks" layers but not "single_transformer_blocks"
+        target_modules = [f"transformer_blocks.{i}.query" for i in range(n_layers)]
+        model = get_peft_model(OuterModule(), LoraConfig(target_modules=target_modules))
+
+        # sanity check: we should have n_layers PEFT layers in model.transformer_blocks
+        transformer_blocks = model.base_model.model.transformer_blocks
+        assert sum(isinstance(module, BaseTunerLayer) for module in transformer_blocks.modules()) == n_layers
+
+        # we should not have any PEFT layers in model.single_transformer_blocks
+        single_transformer_blocks = model.base_model.model.single_transformer_blocks
+        assert not any(isinstance(module, BaseTunerLayer) for module in single_transformer_blocks.modules())
+
+        # target modules should *not* be simplified to "query" as that would match "single_transformers_blocks" too
+        assert model.peft_config["default"].target_modules != {"query"}
+
+    def test_find_minimal_target_modules_does_not_error_with_ia3(self, tmp_path):
+        # See #2429
+        # There is an issue with the compression of the target_modules attribute when using IA³. There, we additionally
+        # have the feedforward_modules attribute, which must be subset of target_modules. When target_modules is shrunk,
+        # the subset check will fail. This test ensures that this doesn't happen.
+        n_layers = MIN_TARGET_MODULES_FOR_OPTIMIZATION + 1
+
+        class InnerModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.query = nn.Linear(10, 10)
+
+        class OuterModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([InnerModule() for _ in range(n_layers)])
+
+        target_modules = [f"blocks.{i}.query" for i in range(n_layers)]
+        feedforward_modules = [f"blocks.{i}.query" for i in range(n_layers)]
+        # the subset check happens here
+        config = IA3Config(target_modules=target_modules, feedforward_modules=feedforward_modules)
+        # the optimization step happens here, after the subset check, so at first we're fine, but we will run into an
+        # issue after a save/load roundtrip
+        model = get_peft_model(OuterModule(), config)
+        model.save_pretrained(tmp_path)
+        del model
+
+        # does not raise
+        PeftModel.from_pretrained(OuterModule(), tmp_path)
+
+
+class TestRankAndAlphaPattern:
+    @pytest.fixture
+    def model(self):
+        # we always target the foo layers, the *bar* layers are used as a control group to ensure that they are not
+        # accidentally targeted
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.foo = nn.Linear(1, 1)
+                self.barfoo = nn.Linear(1, 1)
+
+        class Middle(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.foo = nn.Linear(1, 1)
+                self.foobar = nn.Linear(1, 1)
+                self.module = Inner()
+
+        class Outer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.foo = nn.Linear(1, 1)
+                self.bar = nn.Linear(1, 1)
+                self.module = Middle()
+
+        # resulting model for overview:
+        # Outer(
+        #   (foo): Linear(...)
+        #   (bar): Linear(...)
+        #   (module): Middle(
+        #     (foo): Linear(...)
+        #     (foobar): Linear(...)
+        #     (module): Inner(
+        #       (foo): Linear(...)
+        #       (barfoo): Linear(...)
+        #     )
+        #   )
+        # )
+
+        return Outer()
+
+    def test_no_rank_nor_alpha_pattern(self, model):
+        # sanity check the default case, no rank or alpha pattern
+        config = LoraConfig(target_modules="all-linear")
+        model = get_peft_model(model, config).base_model.model
+        # r is the default rank and alpha, thus scaling is 1.0
+        assert model.foo.r["default"] == 8
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.r["default"] == 8
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.r["default"] == 8
+        assert model.module.module.foo.scaling["default"] == 1.0
+        assert model.module.module.barfoo.r["default"] == 8
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_rank_and_alpha_pattern_no_matching_keys(self, model):
+        # sanity check for non-matching keys, no rank or alpha pattern
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"bla": 4, "oof": 6}, alpha_pattern={"baz": 3})
+        model = get_peft_model(model, config).base_model.model
+        # r is the default rank and alpha, thus scaling is 1.0
+        assert model.foo.r["default"] == 8
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.r["default"] == 8
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.r["default"] == 8
+        assert model.module.module.foo.scaling["default"] == 1.0
+        assert model.module.module.barfoo.r["default"] == 8
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    # below, we test all permutations for rank_pattern of targeting outer, middle, and inner foo layers:
+
+    def test_rank_pattern_target_all(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 16
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 16
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 8
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_middle(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^module.foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 8
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 16
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 8
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"module.module.foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 8
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 16
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_inner_with_caret(self, model):
+        # same as before, but using the caret in the regex should also work
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^module.module.foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 8
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 16
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_middle_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"module.foo": 16})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 8
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 16
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 16
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_middle_inner_different_ranks(self, model):
+        # same layers targeted as in previous test, but with different ranks
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^module.foo": 16, "^module.module.foo": 24})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 8
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 16
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 24
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer_middle(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^foo": 16, "^module.foo": 24})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 24
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 8
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^foo": 16, "module.module.foo": 24})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 24
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer_inner_with_caret(self, model):
+        # same as before, but using the caret in the regex should also work
+        config = LoraConfig(target_modules="all-linear", rank_pattern={"^foo": 16, "^module.module.foo": 24})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 8
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 24
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer_middle_inner_with_caret(self, model):
+        # indicate each layer with a different rank and use the caret in the regex
+        config = LoraConfig(
+            target_modules="all-linear", rank_pattern={"^foo": 16, "^module.foo": 24, "^module.module.foo": 32}
+        )
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 24
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 32
+        assert model.module.module.barfoo.r["default"] == 8
+
+    def test_rank_pattern_target_outer_middle_inner_with_caret_dict_order(self, model):
+        # same as before, but change the order of the rank_pattern dict
+        config = LoraConfig(
+            target_modules="all-linear", rank_pattern={"^module.module.foo": 32, "^module.foo": 24, "^foo": 16}
+        )
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.r["default"] == 16
+        assert model.bar.r["default"] == 8
+        assert model.module.foo.r["default"] == 24
+        assert model.module.foobar.r["default"] == 8
+        assert model.module.module.foo.r["default"] == 32
+        assert model.module.module.barfoo.r["default"] == 8
+
+    # below, we test all permutations for alpha_pattern of targeting outer, middle, and inner foo layers:
+    # these tests are analogous to the rank_pattern tests above
+
+    def test_alpha_pattern_target_all(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.5
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.5
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 1.0
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_middle(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^module.foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.5
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 1.0
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"module.module.foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.5
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_inner_with_caret(self, model):
+        # same as before, but using the caret in the regex should also work
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^module.module.foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.5
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_middle_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"module.foo": 4})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.5
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.5
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_middle_inner_different_alphas(self, model):
+        # same layers targeted as in previous test, but with different alphas
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^module.foo": 4, "^module.module.foo": 2})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 1.0
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.5
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.25
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer_middle(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^foo": 4, "^module.foo": 2})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.25
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 1.0
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer_inner(self, model):
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^foo": 4, "module.module.foo": 2})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.25
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer_inner_with_caret(self, model):
+        # same as before, but using the caret in the regex should also work
+        config = LoraConfig(target_modules="all-linear", alpha_pattern={"^foo": 4, "^module.module.foo": 2})
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 1.0
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.25
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer_middle_inner_with_caret(self, model):
+        # indicate each layer with a different alpha and use the caret in the regex
+        config = LoraConfig(
+            target_modules="all-linear", alpha_pattern={"^foo": 4, "^module.foo": 2, "^module.module.foo": 1}
+        )
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.25
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.125
+        assert model.module.module.barfoo.scaling["default"] == 1.0
+
+    def test_alpha_pattern_target_outer_middle_inner_with_caret_dict_order(self, model):
+        # same as before, but change the order of the alpha_pattern dict
+        config = LoraConfig(
+            target_modules="all-linear", alpha_pattern={"^module.module.foo": 1, "^module.foo": 2, "^foo": 4}
+        )
+        model = get_peft_model(model, config).base_model.model
+        assert model.foo.scaling["default"] == 0.5
+        assert model.bar.scaling["default"] == 1.0
+        assert model.module.foo.scaling["default"] == 0.25
+        assert model.module.foobar.scaling["default"] == 1.0
+        assert model.module.module.foo.scaling["default"] == 0.125
+        assert model.module.module.barfoo.scaling["default"] == 1.0

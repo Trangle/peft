@@ -42,7 +42,7 @@ class LycorisConfig(PeftConfig):
         metadata={
             "help": (
                 "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
-                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}"
+                "For example, `{'^model.decoder.layers.0.encoder_attn.k_proj': 16}`."
             )
         },
     )
@@ -51,7 +51,7 @@ class LycorisConfig(PeftConfig):
         metadata={
             "help": (
                 "The mapping from layer names or regexp expression to alphas which are different from the default alpha specified by `alpha`. "
-                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 32`}"
+                "For example, `{'^model.decoder.layers.0.encoder_attn.k_proj': 16}`."
             )
         },
     )
@@ -71,11 +71,14 @@ class LycorisLayer(BaseTunerLayer):
         self.alpha = {}
         self.scaling = {}
         self.rank_dropout = {}
+        self.rank_dropout_scale = {}
         self.module_dropout = {}
 
         # Tuner info
         self._disable_adapters = False
         self.merged_adapters = []
+        # flag to enable/disable casting of input to weight dtype during forward call
+        self.cast_input_dtype_enabled = True
 
     @property
     @abstractmethod
@@ -187,13 +190,21 @@ class LycorisLayer(BaseTunerLayer):
 class LycorisTuner(BaseTuner):
     r"""
     A base tuner for LyCORIS like adapters
+
+    Args:
+        model ([`torch.nn.Module`]): The model to be adapted.
+        config ([`LoraConfig`]): The configuration of the Lora model.
+        adapter_name (`str`): The name of the adapter, defaults to `"default"`.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            Create empty adapter weights on meta device. Useful to speed up the loading process.
+
     """
 
     prefix: str
     layers_mapping: dict[type[torch.nn.Module], type[LycorisLayer]]
 
-    def __init__(self, model, config, adapter_name):
-        super().__init__(model, config, adapter_name)
+    def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False):
+        super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -290,10 +301,12 @@ class LycorisTuner(BaseTuner):
                 new_module.state = child.state
             new_module.to(child.weight.device)
 
+        meta = torch.device("meta")
         # dispatch to correct device
         for name, module in new_module.named_modules():
             if self.prefix in name:
-                module.to(child.weight.device)
+                if not any(p.device == meta for p in module.parameters()):
+                    module.to(child.weight.device)
 
     def _set_adapter_layers(self, enabled=True):
         for module in self.model.modules():
@@ -423,3 +436,4 @@ class LycorisTuner(BaseTuner):
                     new_adapter = target.active_adapters[:]
 
         self.active_adapter = new_adapter or []
+        self._delete_auxiliary_adapter(adapter_name, new_active_adapters=new_adapter)

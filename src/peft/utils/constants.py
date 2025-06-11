@@ -72,7 +72,22 @@ TRANSFORMERS_MODELS_TO_LNTUNING_TARGET_MODULES_MAPPING = {
     "mistral": ["input_layernorm", "post_attention_layernorm", "norm"],
     "phi": ["input_layernorm", "final_layernorm"],
     "gemma": ["input_layernorm", "post_attention_layernorm", "norm"],
+    "gemma2": [
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+        "norm",
+    ],
+    "gemma3_text": [
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+        "norm",
+    ],
     "qwen2": ["post_attention_layernorm"],
+    "qwen3": ["post_attention_layernorm"],
 }
 
 TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
@@ -94,6 +109,7 @@ TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
     "deberta": ["in_proj"],
     "layoutlm": ["query", "value"],
     "llama": ["q_proj", "v_proj"],
+    "llama4": ["q_proj", "v_proj"],
     "chatglm": ["query_key_value"],
     "gpt_bigcode": ["c_attn"],
     "mpt": ["Wqkv"],
@@ -107,7 +123,10 @@ TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
     "stablelm": ["q_proj", "v_proj"],
     "phi": ["q_proj", "v_proj", "fc1", "fc2"],
     "gemma": ["q_proj", "v_proj"],
+    "gemma2": ["q_proj", "v_proj"],
+    "gemma3_text": ["q_proj", "v_proj"],
     "qwen2": ["q_proj", "v_proj"],
+    "qwen3": ["q_proj", "v_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING = {
@@ -123,6 +142,7 @@ TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING = {
     "bart": ["q_proj", "v_proj", "fc2"],
     "gpt_bigcode": ["c_attn", "mlp.c_proj"],
     "llama": ["k_proj", "v_proj", "down_proj"],
+    "llama4": ["q_proj", "v_proj", "down_proj"],
     "mistral": ["k_proj", "v_proj", "down_proj"],
     "mixtral": ["k_proj", "v_proj", "w2"],
     "bert": ["key", "value", "output.dense"],
@@ -133,7 +153,10 @@ TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING = {
     "falcon": ["query_key_value", "dense_4h_to_h"],
     "phi": ["q_proj", "v_proj", "fc2"],
     "gemma": ["q_proj", "v_proj", "down_proj"],
+    "gemma2": ["q_proj", "v_proj", "down_proj"],
+    "gemma3_text": ["q_proj", "v_proj", "down_proj"],
     "qwen2": ["q_proj", "v_proj", "down_proj"],
+    "qwen3": ["q_proj", "v_proj", "down_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING = {
@@ -149,6 +172,7 @@ TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING = {
     "bart": ["fc2"],
     "gpt_bigcode": ["mlp.c_proj"],
     "llama": ["down_proj"],
+    "llama4": ["down_proj"],
     "mistral": ["down_proj"],
     "mixtral": ["w2"],
     "bert": ["output.dense"],
@@ -159,7 +183,10 @@ TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING = {
     "falcon": ["dense_4h_to_h"],
     "phi": ["fc2"],
     "gemma": ["down_proj"],
+    "gemma2": ["down_proj"],
+    "gemma3_text": ["down_proj"],
     "qwen2": ["down_proj"],
+    "qwen3": ["down_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING = {
@@ -173,6 +200,7 @@ TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING = {
     "gpt_neox": ["query_key_value"],
     "gpt_neo": ["q_proj", "v_proj"],
     "llama": ["q_proj", "v_proj"],
+    "llama4": ["q_proj", "v_proj"],
     "bert": ["query", "value"],
     "roberta": ["query", "key", "value", "dense"],
     # "xlm-roberta": ["query", "value"],
@@ -181,7 +209,11 @@ TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING = {
     "gpt_bigcode": ["c_attn"],
     "deberta": ["in_proj"],
     # "layoutlm": ["query", "value"],
+    "gemma": ["q_proj", "v_proj"],
+    "gemma2": ["q_proj", "v_proj"],
+    "gemma3_text": ["q_proj", "v_proj"],
     "qwen2": ["q_proj", "v_proj"],
+    "qwen3": ["q_proj", "v_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING = {
@@ -203,6 +235,7 @@ TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING = {
     "deberta": ["in_proj"],
     "layoutlm": ["query", "value"],
     "llama": ["q_proj", "v_proj"],
+    "llama4": ["q_proj", "v_proj"],
     "chatglm": ["query_key_value"],
     "gpt_bigcode": ["c_attn"],
     "mpt": ["Wqkv"],
@@ -216,7 +249,10 @@ TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING = {
     "stablelm": ["q_proj", "v_proj"],
     "phi": ["q_proj", "v_proj"],
     "gemma": ["q_proj", "v_proj"],
+    "gemma2": ["q_proj", "v_proj"],
+    "gemma3_text": ["q_proj", "v_proj"],
     "qwen2": ["q_proj", "v_proj"],
+    "qwen3": ["q_proj", "v_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_FOURIERFT_TARGET_MODULES_MAPPING = {
@@ -238,6 +274,7 @@ TRANSFORMERS_MODELS_TO_FOURIERFT_TARGET_MODULES_MAPPING = {
     "deberta": ["in_proj"],
     "layoutlm": ["query", "value"],
     "llama": ["q_proj", "v_proj"],
+    "llama4": ["q_proj", "v_proj"],
     "chatglm": ["query_key_value"],
     "gpt_bigcode": ["mlp.c_proj"],
     "mpt": ["Wqkv"],
@@ -250,7 +287,10 @@ TRANSFORMERS_MODELS_TO_FOURIERFT_TARGET_MODULES_MAPPING = {
     "stablelm": ["q_proj", "v_proj"],
     "phi": ["q_proj", "v_proj", "fc1", "fc2"],
     "gemma": ["q_proj", "v_proj"],
+    "gemma2": ["q_proj", "v_proj"],
+    "gemma3_text": ["q_proj", "v_proj"],
     "qwen2": ["q_proj", "v_proj"],
+    "qwen3": ["q_proj", "v_proj"],
 }
 
 TRANSFORMERS_MODELS_TO_VBLORA_TARGET_MODULES_MAPPING = {
@@ -264,13 +304,22 @@ TRANSFORMERS_MODELS_TO_VBLORA_TARGET_MODULES_MAPPING = {
     "gpt_neox": ["query_key_value"],
     "gpt_neo": ["q_proj", "v_proj"],
     "llama": ["q_proj", "v_proj"],
+    "llama4": ["q_proj", "v_proj"],
     "bert": ["query", "value"],
     "roberta": ["query", "value"],
     "deberta-v2": ["query_proj", "key_proj", "value_proj", "dense"],
     "gpt_bigcode": ["c_attn"],
     "deberta": ["in_proj"],
+    "gemma": ["q_proj", "v_proj"],
+    "gemma2": ["q_proj", "v_proj"],
+    "gemma3_text": ["q_proj", "v_proj"],
     "qwen2": ["q_proj", "v_proj"],
+    "qwen3": ["q_proj", "v_proj"],
 }
+
+TRANSFORMERS_MODELS_TO_RANDLORA_TARGET_MODULES_MAPPING = (
+    TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING  # Leaving this for now but RandLoRA is flexible
+)
 
 WEIGHTS_NAME = "adapter_model.bin"
 SAFETENSORS_WEIGHTS_NAME = "adapter_model.safetensors"

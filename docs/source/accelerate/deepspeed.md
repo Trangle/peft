@@ -94,7 +94,7 @@ accelerate launch --config_file "configs/deepspeed_config.yaml"  train.py \
 --logging_steps 5 \
 --log_level "info" \
 --logging_strategy "steps" \
---evaluation_strategy "epoch" \
+--eval_strategy "epoch" \
 --save_strategy "epoch" \
 --push_to_hub \
 --hub_private_repo True \
@@ -128,7 +128,7 @@ Notice that we are using LoRA with  rank=8, alpha=16 and targeting all linear la
 
 Let's dive a little deeper into the script so you can see what's going on, and understand how it works.
 
-The first thing to know is that the script uses DeepSpeed for distributed training as the DeepSpeed config has been passed. The `SFTTrainer` class handles all the heavy lifting of creating the PEFT model using the peft config that is passed. After that, when you call `trainer.train()`, `SFTTrainer` internally uses 🤗 Accelerate to prepare the model, optimizer and trainer using the DeepSpeed config to create DeepSpeed engine which is then trained. The main code snippet is below:
+The first thing to know is that the script uses DeepSpeed for distributed training as the DeepSpeed config has been passed. The [`~trl.SFTTrainer`] class handles all the heavy lifting of creating the PEFT model using the peft config that is passed. After that, when you call `trainer.train()`, [`~trl.SFTTrainer`] internally uses 🤗 Accelerate to prepare the model, optimizer and trainer using the DeepSpeed config to create DeepSpeed engine which is then trained. The main code snippet is below:
 
 ```python
 # trainer
@@ -139,13 +139,6 @@ trainer = SFTTrainer(
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     peft_config=peft_config,
-    packing=data_args.packing,
-    dataset_kwargs={
-        "append_concat_token": data_args.append_concat_token,
-        "add_special_tokens": data_args.add_special_tokens,
-    },
-    dataset_text_field=data_args.dataset_text_field,
-    max_seq_length=data_args.max_seq_length,
 )
 trainer.accelerator.print(f"{trainer.model}")
 
@@ -175,7 +168,7 @@ You can also refer this blog post [Falcon 180B Finetuning using 🤗 PEFT and De
 # Use PEFT QLoRA and DeepSpeed with ZeRO3 for finetuning large models on multiple GPUs
 
 In this section, we will look at how to use QLoRA and DeepSpeed Stage-3 for finetuning 70B llama model on 2X40GB GPUs.
-For this, we first need `bitsandbytes>=0.43.0`, `accelerate>=0.28.0`, `transformers>4.38.2`, `trl>0.7.11` and `peft>0.9.0`. We need to set `zero3_init_flag` to true when using Accelerate config. Below is the config which can be found at [deepspeed_config_z3_qlora.yaml](https://github.com/huggingface/peft/blob/main/examples/sft/configs/deepspeed_config_z3_qlora.yaml):
+For this, we first need `bitsandbytes>=0.43.3`, `accelerate>=1.0.1`, `transformers>4.44.2`, `trl>0.11.4` and `peft>0.13.0`. We need to set `zero3_init_flag` to true when using Accelerate config. Below is the config which can be found at [deepspeed_config_z3_qlora.yaml](https://github.com/huggingface/peft/blob/main/examples/sft/configs/deepspeed_config_z3_qlora.yaml):
 
 ```yml
 compute_environment: LOCAL_MACHINE                                                                                                                                           
@@ -202,7 +195,7 @@ tpu_use_sudo: false
 use_cpu: false
 ```
 
-Launch command is given below which is available at [run_peft_qlora_deepspeed_stage3.sh](https://github.com/huggingface/peft/blob/main/examples/sft/run_peft_deepspeed.sh):
+Launch command is given below which is available at [run_peft_qlora_deepspeed_stage3.sh](https://github.com/huggingface/peft/blob/main/examples/sft/run_peft_qlora_deepspeed_stage3.sh):
 ```
 accelerate launch --config_file "configs/deepspeed_config_z3_qlora.yaml"  train.py \
 --seed 100 \
@@ -217,7 +210,7 @@ accelerate launch --config_file "configs/deepspeed_config_z3_qlora.yaml"  train.
 --logging_steps 5 \
 --log_level "info" \
 --logging_strategy "steps" \
---evaluation_strategy "epoch" \
+--eval_strategy "epoch" \
 --save_strategy "epoch" \
 --push_to_hub \
 --hub_private_repo True \
@@ -445,3 +438,21 @@ dataset['train'][label_column][:10]=['no complaint', 'no complaint', 'complaint'
 1. Merging when using PEFT and DeepSpeed is currently unsupported and will raise error.
 2. When using CPU offloading, the major gains from using PEFT to shrink the optimizer states and gradients to that of the adapter weights would be realized on CPU RAM and there won't be savings with respect to GPU memory.
 3. DeepSpeed Stage 3 and qlora when used with CPU offloading leads to more GPU memory usage when compared to disabling CPU offloading. 
+
+<Tip>
+
+💡 When you have code that requires merging (and unmerging) of weights, try to manually collect the parameters with DeepSpeed Zero-3 beforehand:
+
+```python
+import deepspeed
+
+is_ds_zero_3 = ... # check if Zero-3
+
+with deepspeed.zero.GatheredParameters(list(model.parameters()), enabled= is_ds_zero_3):
+    model.merge_adapter()
+    # do whatever is needed, then unmerge in the same context if unmerging is required
+    ...
+    model.unmerge_adapter()
+```
+
+</Tip>

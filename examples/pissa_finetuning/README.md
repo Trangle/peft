@@ -1,13 +1,12 @@
 # PiSSA: Principal Singular values and Singular vectors Adaptation
-## Introduction ([Paper](https://arxiv.org/abs/2404.02948), [code](https://github.com/GraphPKU/PiSSA))
+## Introduction ([Paper](https://huggingface.co/papers/2404.02948), [code](https://github.com/GraphPKU/PiSSA))
 PiSSA represents a matrix $W\in\mathbb{R}^{m\times n}$ within the model by the product of two trainable matrices $A \in \mathbb{R}^{m\times r}$ and $B \in \mathbb{R}^{r\times n}$, where $r \ll \min(m, n)$, plus a residual matrix $W^{res}\in\mathbb{R}^{m\times n}$ for error correction. Singular value decomposition (SVD) is employed to factorize $W$, and the principal singular values and vectors of $W$ are utilized to initialize $A$ and $B$. The residual singular values and vectors initialize the residual matrix $W^{res}$, which keeps frozen during fine-tuning. This straightforward modification allows PiSSA to converge more rapidly than LoRA and ultimately attain superior performance. Moreover, PiSSA reduces the quantization error compared to QLoRA, leading to further enhancements.
 
 ## Quick Start
 ```python
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import SFTTrainer
+from transformers import AutoTokenizer, AutoModelForCausalLMfrom trl import SFTConfig, SFTTrainer
 from datasets import load_dataset
 
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf", torch_dtype=torch.bfloat16, device_map="auto")
@@ -23,11 +22,11 @@ peft_model.print_trainable_parameters()
 
 dataset = load_dataset("imdb", split="train[:1%]")
 
+training_args = SFTConfig(dataset_text_field="text", max_seq_length=128)
 trainer = SFTTrainer(
     model=peft_model,
+    args=training_args,
     train_dataset=dataset,
-    dataset_text_field="text",
-    max_seq_length=128,
     tokenizer=tokenizer,
 )
 trainer.train()
@@ -72,7 +71,7 @@ The main advantage of PiSSA is concentrated during the training phase. For a tra
 peft_model.save_pretrained(output_dir) 
 # Given the matrices $A_0$ and $B_0$, initialized by PiSSA and untrained, and the trained matrices $A$ and $B$, 
 # we can convert these to LoRA by setting $\Delta W = A \times B - A_0 \times B_0 = [A \mid A_0] \times [B \mid -B_0]^T = A'B'$.
-peft_model.save_pretrained(output_dir, convert_pissa_to_lora="pissa_init")
+peft_model.save_pretrained(output_dir, path_initial_model_for_weight_conversion="pissa_init")
 
 ```
 This conversion enables the loading of LoRA on top of a standard base model:

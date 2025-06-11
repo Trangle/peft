@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Optional, Set, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,7 @@ class LoKrLayer(nn.Module, LycorisLayer):
         self.lokr_t2 = nn.ParameterDict({})
 
     @property
-    def _available_adapters(self) -> Set[str]:
+    def _available_adapters(self) -> set[str]:
         return {
             *self.lokr_w1,
             *self.lokr_w1_a,
@@ -126,6 +126,23 @@ class LoKrLayer(nn.Module, LycorisLayer):
         if adapter_name in self.lokr_t2:
             nn.init.kaiming_uniform_(self.lokr_t2[adapter_name], a=math.sqrt(5))
 
+    # Initializes weight matrices similar to the way initialized in the LyCORIS repository.
+    def reset_adapter_parameters_lycoris_way(self, adapter_name):
+        if adapter_name in self.lokr_w1:
+            nn.init.kaiming_uniform_(self.lokr_w1[adapter_name], a=math.sqrt(5))
+        else:
+            nn.init.kaiming_uniform_(self.lokr_w1_a[adapter_name], a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lokr_w1_b[adapter_name], a=math.sqrt(5))
+
+        if adapter_name in self.lokr_w2:
+            nn.init.zeros_(self.lokr_w2[adapter_name])
+        else:
+            nn.init.zeros_(self.lokr_w2_b[adapter_name])
+            nn.init.kaiming_uniform_(self.lokr_w2_a[adapter_name], a=math.sqrt(5))
+
+        if adapter_name in self.lokr_t2:
+            nn.init.kaiming_uniform_(self.lokr_t2[adapter_name], a=math.sqrt(5))
+
     def update_layer(
         self,
         adapter_name: str,
@@ -160,6 +177,7 @@ class LoKrLayer(nn.Module, LycorisLayer):
         self.scaling[adapter_name] = alpha / r
         self.rank_dropout[adapter_name] = rank_dropout
         self.module_dropout[adapter_name] = module_dropout
+        self.rank_dropout_scale[adapter_name] = kwargs["rank_dropout_scale"]
         base_layer = self.get_base_layer()
 
         # Determine shape of LoKr weights
@@ -192,7 +210,10 @@ class LoKrLayer(nn.Module, LycorisLayer):
 
         # Initialize weights
         if init_weights:
-            self.reset_adapter_parameters(adapter_name)
+            if init_weights == "lycoris":
+                self.reset_adapter_parameters_lycoris_way(adapter_name)
+            else:
+                self.reset_adapter_parameters(adapter_name)
         else:
             self.reset_adapter_parameters_random(adapter_name)
 
@@ -215,7 +236,7 @@ class LoKrLayer(nn.Module, LycorisLayer):
             w2 = self.lokr_w2_a[adapter_name] @ self.lokr_w2_b[adapter_name]
 
         # Make weights with Kronecker product
-        weight = make_kron(w1, w2)
+        weight = make_kron(w1, w2, self.scaling[adapter_name])
         weight = weight.reshape(self.get_base_layer().weight.shape)
 
         # Perform rank dropout during training - drop rows of addition weights
@@ -223,7 +244,8 @@ class LoKrLayer(nn.Module, LycorisLayer):
         if self.training and rank_dropout:
             drop = (torch.rand(weight.size(0)) > rank_dropout).float()
             drop = drop.view(-1, *[1] * len(weight.shape[1:])).to(weight.device)
-            drop /= drop.mean()
+            if self.rank_dropout_scale[adapter_name]:
+                drop /= drop.mean()
             weight *= drop
 
         return weight
@@ -281,6 +303,7 @@ class Linear(LoKrLayer):
         self, adapter_name: str, input: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
         delta_weight = self.get_delta_weight(adapter_name)
+        input = self._cast_input_dtype(input, delta_weight.dtype)
         # don't add bias here, because the bias is already included in the output of the base_layer
         return F.linear(input, delta_weight)
 
@@ -318,6 +341,7 @@ class Conv2d(LoKrLayer):
         self, adapter_name: str, input: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
         delta_weight = self.get_delta_weight(adapter_name)
+        input = self._cast_input_dtype(input, delta_weight.dtype)
         # don't add bias here, because the bias is already included in the output of the base_layer
         base_layer = self.get_base_layer()
         return F.conv2d(
@@ -337,7 +361,7 @@ class Conv2d(LoKrLayer):
 # Below code is a direct copy from https://github.com/KohakuBlueleaf/LyCORIS/blob/eb460098187f752a5d66406d3affade6f0a07ece/lycoris/modules/lokr.py#L11
 
 
-def factorization(dimension: int, factor: int = -1) -> Tuple[int, int]:
+def factorization(dimension: int, factor: int = -1) -> tuple[int, int]:
     """Factorizes the provided number into the product of two numbers
 
     Args:

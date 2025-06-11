@@ -17,7 +17,7 @@ import warnings
 import torch
 from transformers.pytorch_utils import Conv1D
 
-from peft.import_utils import is_bnb_4bit_available, is_bnb_available
+from peft.import_utils import is_bnb_4bit_available, is_bnb_available, is_gptqmodel_available
 from peft.tuners.lora import LoraConfig, LoraModel
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import (
@@ -25,6 +25,7 @@ from peft.utils import (
     _freeze_adapter,
     _get_submodules,
     get_auto_gptq_quant_linear,
+    get_gptqmodel_quant_linear,
     get_quantization_config,
 )
 from peft.utils.integrations import gather_params_ctx
@@ -42,6 +43,8 @@ class AdaLoraModel(LoraModel):
         model ([`transformers.PreTrainedModel`]): The model to be adapted.
         config ([`AdaLoraConfig`]): The configuration of the AdaLora model.
         adapter_name (`str`): The name of the adapter, defaults to `"default"`.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            Create empty adapter weights on meta device. Useful to speed up the loading process.
 
     Returns:
         `torch.nn.Module`: The AdaLora model.
@@ -133,7 +136,8 @@ class AdaLoraModel(LoraModel):
 
         # If it is not an AdaLoraLayer, create a new module, else update it with new adapters
         if not isinstance(target, AdaLoraLayer):
-            new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)
+            device_map = self.model.hf_device_map if hasattr(self.model, "hf_device_map") else None
+            new_module = self._create_new_module(lora_config, adapter_name, target, device_map=device_map, **kwargs)
             if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
@@ -148,7 +152,7 @@ class AdaLoraModel(LoraModel):
             )
 
     @staticmethod
-    def _create_new_module(lora_config, adapter_name, target, **kwargs):
+    def _create_new_module(lora_config, adapter_name, target, device_map=None, **kwargs):
         # avoid eager bnb import
         if is_bnb_available():
             import bitsandbytes as bnb
@@ -158,7 +162,11 @@ class AdaLoraModel(LoraModel):
             from .bnb import SVDLinear4bit
 
         gptq_quantization_config = kwargs.get("gptq_quantization_config", None)
-        AutoGPTQQuantLinear = get_auto_gptq_quant_linear(gptq_quantization_config)
+
+        if is_gptqmodel_available():
+            QuantLinear = get_gptqmodel_quant_linear(gptq_quantization_config, device_map=device_map)
+        else:
+            QuantLinear = get_auto_gptq_quant_linear(gptq_quantization_config)
 
         loaded_in_8bit = kwargs.pop("loaded_in_8bit", False)
         loaded_in_4bit = kwargs.pop("loaded_in_4bit", False)
@@ -172,7 +180,6 @@ class AdaLoraModel(LoraModel):
             kwargs.update(
                 {
                     "has_fp16_weights": target_base_layer.state.has_fp16_weights,
-                    "memory_efficient_backward": target_base_layer.state.memory_efficient_backward,
                     "threshold": target_base_layer.state.threshold,
                     "index": target_base_layer.index,
                 }
@@ -188,7 +195,7 @@ class AdaLoraModel(LoraModel):
                 }
             )
             new_module = SVDLinear4bit(target, adapter_name, **fourbit_kwargs)
-        elif AutoGPTQQuantLinear is not None and isinstance(target, AutoGPTQQuantLinear):
+        elif QuantLinear is not None and isinstance(target, QuantLinear):
             new_module = SVDQuantLinear(target, adapter_name, **kwargs)
         else:
             if isinstance(target_base_layer, torch.nn.Linear):

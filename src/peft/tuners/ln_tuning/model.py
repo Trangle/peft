@@ -31,12 +31,14 @@ class LNTuningModel(BaseTuner):
     """
     Creates LayerNorm tuning from a pretrained transformer model.
 
-    The method is described in detail in https://arxiv.org/abs/2312.11420.
+    The method is described in detail in https://huggingface.co/papers/2312.11420.
 
     Args:
         model ([`torch.nn.Module`]): The model to be adapted.
         config ([`LNTuningConfig`]): The configuration of the Lora model.
         adapter_name (`str`): The name of the adapter, defaults to `"default"`.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            This option has no effect on LN tuning but exists for consistency with other PEFT methods.
 
     Returns:
         'torch.nn.Module': The adapted model with LayerNorm tuned on.
@@ -63,9 +65,9 @@ class LNTuningModel(BaseTuner):
 
     prefix: str = "ln_tuning_"
 
-    def __init__(self, model, config, adapter_name) -> None:
+    def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False) -> None:
         # self.adapter_name = adapter_name
-        super().__init__(model, config, adapter_name)
+        super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -201,3 +203,9 @@ class LNTuningModel(BaseTuner):
         self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None
     ) -> nn.Module:
         return self._unload_and_optionally_merge(merge=True)
+
+    def _cast_adapter_dtype(self, adapter_name: str, autocast_adapter_dtype: bool = True) -> None:
+        # Note: LN Tuning does not add adapter layers, instead it creates copies of the original layer. For this reason,
+        # we need to skip adapter autocasting, otherwise we would change the dtype of copies of the original layer,
+        # resulting in dtype errors down the line.
+        pass

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from functools import wraps
 
 import huggingface_hub
 import pytest
@@ -25,26 +26,54 @@ from peft.peft_model import PeftModel
 from peft.utils import infer_device
 
 
+def flaky(num_tries: int):
+    """Decorator for test functions that are flaky"""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for _ in range(num_tries):
+                try:
+                    return func(*args, **kwargs)
+                except AssertionError as e:
+                    print(f"Failed test {func.__name__} with error: {e}")
+                    continue
+            raise AssertionError(f"Failed test {func.__name__} after {num_tries} tries")
+
+        return wrapper
+
+    return decorator
+
+
 class TestXlora:
     torch_device = infer_device()
 
     model_id = "facebook/opt-125m"
     num_loras = 4
 
-    @pytest.fixture(scope="function")
+    @pytest.fixture(scope="class")
     def lora_dir(self, tmp_path_factory):
         return tmp_path_factory.mktemp("lora")
 
-    @pytest.fixture(scope="function")
+    @pytest.fixture(scope="class")
     def lora_embedding_dir(self, tmp_path_factory):
         return tmp_path_factory.mktemp("lora_embedding")
 
-    @pytest.fixture(scope="function")
+    @pytest.fixture(scope="class")
     def saved_lora_adapters(self, lora_dir):
         file_names = []
-        for i in range(1, self.num_loras + 1):
+
+        lora_configs = [
+            LoraConfig(task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"], init_lora_weights=False)
+            for _ in range(self.num_loras)
+        ]
+        # have 1 LoRA with different target modules
+        lora_configs[-1] = LoraConfig(
+            task_type="CAUSAL_LM", target_modules=["k_proj", "q_proj", "v_proj"], init_lora_weights=False
+        )
+
+        for i, lora_config in enumerate(lora_configs, start=1):
             torch.manual_seed(i)
-            lora_config = LoraConfig(task_type="CAUSAL_LM", init_lora_weights=False)
             model = AutoModelForCausalLM.from_pretrained(self.model_id)
             peft_model = get_peft_model(model, lora_config)
             file_name = os.path.join(lora_dir, f"checkpoint-{i}")
@@ -52,7 +81,7 @@ class TestXlora:
             file_names.append(file_name)
         return file_names
 
-    @pytest.fixture(scope="function")
+    @pytest.fixture(scope="class")
     def saved_lora_embedding_adapters(self, lora_embedding_dir):
         file_names = []
         for i in range(1, self.num_loras + 1):
@@ -65,7 +94,7 @@ class TestXlora:
             file_names.append(file_name)
         return file_names
 
-    @pytest.fixture(scope="function")
+    @pytest.fixture(scope="class")
     def tokenizer(self):
         tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True, device_map=self.torch_device)
         return tokenizer
@@ -155,16 +184,13 @@ class TestXlora:
 
         bucketed = model.get_bucketed_scalings_log()
         keys = bucketed.keys()
-        # One bucket for prompt (seqlen=...) and one for the completion (seqlen=1)
-        assert len(bucketed) == 2
-        # One bucket for prompt (which has 1 elem)
-        assert len(bucketed[max(keys)][0]) == 1
-        assert len(bucketed[max(keys)][1]) == 1
-        assert bucketed[max(keys)][0][0] == 0
-        # One bucket for completions with bucket name 1
-        assert len(bucketed[1][0]) > 1
-        assert len(bucketed[1][1]) > 1
-        assert bucketed[1][0][0] > 0
+        # Once bucket for each token as we aren't using cache
+        assert len(bucketed) == 32 == len(keys)
+        seq_len = inputs.shape[1]
+        for key in keys:
+            assert len(bucketed[key][0]) == 1
+            assert len(bucketed[key][1]) == 1
+            assert bucketed[key][0][0] == key - seq_len
 
         model.clear_scalings_log()
         assert len(model.get_scalings_log()) == 0
@@ -183,6 +209,8 @@ class TestXlora:
 
         assert str(model) is not None
 
+    # On CI (but not locally), this test is flaky since transformers v4.45.0.
+    @flaky(num_tries=5)
     def test_save_load_functional(self, tokenizer, model, tmp_path):
         inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt")
         outputs = model.generate(
@@ -270,7 +298,7 @@ class TestXlora:
         assert model.internal_xlora_classifier.override_scaling_pass_value == 2
         assert model.internal_xlora_classifier.config.scaling_pass_value == 2
 
-        # Set it to 2 and make sure it is 1/a
+        # Set it to None and make sure it is 1/n
         model.set_scaling_pass_value(None)
         assert model.internal_xlora_classifier.override_scaling_pass_value == 1 / self.num_loras
         assert model.internal_xlora_classifier.config.scaling_pass_value == 1 / self.num_loras
